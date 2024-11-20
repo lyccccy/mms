@@ -288,7 +288,7 @@ def validate(state, val_dataloader, writer, epoch):
     if hasattr(state.optimizer_g, "consolidate_state_dict"):
         state.optimizer_g.consolidate_state_dict()
         state.optimizer_d.consolidate_state_dict()
-
+    state.generator.train()
     return aggregated_output, filelists  # 返回损失和文件名
 
 def checkpoint(state, filelists, step,realstep, save_path="./checkpoints/"+f"{mode}"):

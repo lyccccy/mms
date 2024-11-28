@@ -23,7 +23,8 @@ from torch.utils.tensorboard import SummaryWriter
 import time
 from accelerate import Accelerator
 from accelerate.utils import set_seed
-# 初始化TensorBoard
+from safetensors.torch import load_model# 初始化TensorBoard
+from safetensors.torch import load_file
 
 # 学习率调度器
 def ExponentialLR(optimizer, gamma: float = 0.999996):
@@ -31,19 +32,15 @@ def ExponentialLR(optimizer, gamma: float = 0.999996):
 
 
 # 初始化加速器
-mode = "dac"
-loadpath = "./multigpucheckpoints/"+f'{mode}'
-savepath = "./multigpucheckpoints/"+f"{mode}"
+mode = "distill"
+loadpath = "./multigpucheckpoints/"+f'{mode}' + "_music_5"
+savepath = "./multigpucheckpoints/"+f"{mode}" + "_music_5"
 # 定义超参数
-bs1 = 4
+bs1 = 3
 bs2 = 4
 epochs = 100000
-accumulation_steps = 4  # 梯度累积步数
+accumulation_steps = 5  # 梯度累积步数
 validation_steps = 8000  # 每8000步进行一次评估
-
-
-
-
 
 
 # 设置设备
@@ -56,11 +53,7 @@ model = MSS(mode = mode).to(device)
 
 discriminator = disc().to(device)
 
-#设置语义老师
-if mode != 'dac':
-    teacher=Demucs(audio_channels=2)
-    teacher = teacher.to('cpu')
-    teacher.load_state_dict(torch.load("/home/yuechengl/mss/demucs-e07c671f.th"))
+
 # 准备模型
 #model = accel.prepare_model(model)
 #discriminator = accel.prepare_model(discriminator)
@@ -73,17 +66,27 @@ optimizer_d = torch.optim.AdamW(params=discriminator.parameters(), lr=0.0001, be
 scheduler_d = ExponentialLR(optimizer_d)
 
 # 加载数据集
-train_dataset = DACtrainDataset(filelist="/home/ch/descript-audio-codec/filelist/speech_train_DAC_meger.txt", sample_rate=44100, duration=0.38, batchsize=bs1)
+train_dataset = DACtrainDataset(filelist="/home/ch/descript-audio-codec/filelist/music/music_train_filelist.txt", sample_rate=44100, duration=0.38, batchsize=bs1)
 train_loader = DataLoader(train_dataset, batch_size=bs2, num_workers=6,collate_fn=traincollate)
 
-val_dataset = DACtrainDataset(filelist="/home/ch/descript-audio-codec/filelist/speech_val_DAC.txt", sample_rate=44100, duration=5,batchsize=1)
+val_dataset = DACtrainDataset(filelist="/home/ch/descript-audio-codec/filelist/music/music_val_filelist.txt", sample_rate=44100, duration=5,batchsize=1)
 val_dataloader = DataLoader(val_dataset, batch_size=1, num_workers=2, collate_fn=traincollate,shuffle=False)
 
 set_seed(42)
 accelerator = Accelerator(project_dir=savepath,mixed_precision='fp16')
 accelerator.print(f'device {str(accelerator.device)} is used!')
-model, discriminator,optimizer_g,scheduler_g, optimizer_d, scheduler_d ,train_loader,val_dataloader= accelerator.prepare(
-model, discriminator,optimizer_g,scheduler_g, optimizer_d, scheduler_d,train_loader,val_dataloader)
+#设置语义老师
+if mode != 'dac':
+    teacher=Demucs(audio_channels=2)
+    #teacher.load_state_dict(torch.load("/home/yuechengl/mss/demucs-e07c671f.th"))
+    model, discriminator,teacher,optimizer_g,scheduler_g, optimizer_d, scheduler_d ,train_loader,val_dataloader= accelerator.prepare(
+    model, discriminator,teacher,optimizer_g,scheduler_g, optimizer_d, scheduler_d,train_loader,val_dataloader)
+    unwrapped_model = accelerator.unwrap_model(teacher)
+    unwrapped_model.load_state_dict(torch.load("/home/yuechengl/mss/demucs-e07c671f.th"))
+    teacher.eval()
+else:
+    model, discriminator,optimizer_g,scheduler_g, optimizer_d, scheduler_d ,train_loader,val_dataloader= accelerator.prepare(
+    model, discriminator,optimizer_g,scheduler_g, optimizer_d, scheduler_d,train_loader,val_dataloader)
 # 定义损失函数
 waveform_loss = L1Loss().to(device)
 stft_loss = MultiScaleSTFTLoss().to(device)
@@ -91,9 +94,7 @@ mel_loss = MelSpectrogramLoss().to(device)
 gan_loss = GANLoss(discriminator).to(device)
 writer = None
 if accelerator.is_main_process:
-    writer = SummaryWriter(log_dir=f"./runs/"+f"{mode}/"+time.strftime('%y-%m-%d_%H.%M', time.localtime()))
-
-
+    writer = SummaryWriter(log_dir=f"./runs/"+f"{mode}_music/"+time.strftime('%y-%m-%d_%H.%M', time.localtime()))
 
 
 # 保存验证损失和最优模型信息a
@@ -109,7 +110,7 @@ if mode == 'distill':
         "adv/gen_loss": 1.0,
         "vq/commitment_loss": 0.25,
         "vq/codebook_loss": 1.0,
-        "vq/distill_loss":10
+        "vq/distill_loss":2
     }
 else:
     lambdas = {
@@ -149,6 +150,19 @@ state = TrainingState(
     gan_loss=gan_loss,
     val_data=val_dataset,
 )
+
+def modelload(model,load_path,addmodule:bool=True):
+    state_dict = load_file(load_path)
+    new_state_dict=state_dict
+    # 修正键名（移除 "module." 前缀）
+    if addmodule:
+        new_state_dict = {"module." + k: v for k, v in state_dict.items()}
+
+    # 加载修正后的权重
+    model.load_state_dict(new_state_dict)
+    #load_model(model,load_path)
+    #return model
+
 
 def acceleratorload(state, load_path=loadpath):
     step_pattern = re.compile(r"step_(\d+)\.pth")
@@ -247,7 +261,7 @@ def validate(state, val_dataloader, writer, epoch):
             originlength = signal.audio_data.shape[-1]
             
             if mode !="dac":
-                semetic_real = teacher.encode(pre_audio.to('cpu'))
+                semetic_real = teacher.module.encode(pre_audio)
                 semetic_real = accelerator.prepare(semetic_real)
             else:
                 semetic_real = None
@@ -283,12 +297,13 @@ def validate(state, val_dataloader, writer, epoch):
                 reconstructed_audio = recons.audio_data.squeeze(0)
                 if(accelerator.is_main_process):
                 # 分别保存左声道和右声道
-                    writer.add_audio(f'batch{batch_idx}/Original_Left', original_audio[0], step//accumulation_steps, sample_rate=44100)
-                    writer.add_audio(f'batch{batch_idx}/Reconstructed_Left', reconstructed_audio[0], step//accumulation_steps, sample_rate=44100)
+                    currentstep = step//accumulation_steps
+                    writer.add_audio(f'batch{batch_idx}/Original_Left', original_audio[0], currentstep, sample_rate=44100)
+                    writer.add_audio(f'batch{batch_idx}/Reconstructed_Left', reconstructed_audio[0], currentstep, sample_rate=44100)
 
-                    writer.add_audio(f'batch{batch_idx}/Original_Right', original_audio[1], step//accumulation_steps, sample_rate=44100)
+                    writer.add_audio(f'batch{batch_idx}/Original_Right', original_audio[1], currentstep, sample_rate=44100)
                     
-                    writer.add_audio(f'batch{batch_idx}/Reconstructed_Right', reconstructed_audio[1], step//accumulation_steps, sample_rate=44100)
+                    writer.add_audio(f'batch{batch_idx}/Reconstructed_Right', reconstructed_audio[1], currentstep, sample_rate=44100)
 
             # 收集文件名
             if 'filename' in batch:
@@ -301,9 +316,9 @@ def validate(state, val_dataloader, writer, epoch):
     for key in aggregated_output:
         aggregated_output[key] = (aggregated_output[key] / total_batches).item()  # 计算平均值
         if accelerator.is_main_process:
-            writer.add_scalar(f'Validation/{key}', aggregated_output[key], step)  # 写入TensorBoard
+            writer.add_scalar(f'Validation/{key}', aggregated_output[key], step//accumulation_steps)  # 写入TensorBoard
     if accelerator.is_main_process:
-        writer.add_scalar('Validation/Mel_Loss', aggregated_output["mel/loss"], step)
+        writer.add_scalar('Validation/Mel_Loss', aggregated_output["mel/loss"], step//accumulation_steps)
     accelerator.wait_for_everyone()
     metadata["val_loss"].append(aggregated_output)
     metadata.setdefault("val_filenames", []).extend(filelists)  # 保存文件名
@@ -391,13 +406,15 @@ def acccheckpoint(state, filelists, step,realstep, save_path=savepath):
 
 
 # 开始训练
-try:
-#step=acceleratorload(state=state)  # 全局步数计数器
-    step = load_checkpoint(state=state)
-except Exception as e:
-    print("checkpoint no found, restart training")
-    step = 0
-
+#try:
+    #step=acceleratorload(state=state)  # 全局步数计数器
+    #step = load_checkpoint(state=state)
+#except Exception as e:
+    #print("checkpoint no found, restart training")
+    #step = 0
+step = 0
+modelload(model=model,load_path="/home/yuechengl/mss/multigpucheckpoints/dac/best_mel_loss_0_6617_step_252000.pth/model.safetensors")
+modelload(model=discriminator,load_path="/home/yuechengl/mss/multigpucheckpoints/dacmusic/best_mel_loss_1_2601_step_12000.pth/model_1.safetensors")
 Step = step/accumulation_steps
 
 
@@ -427,7 +444,7 @@ for epoch in range(epochs):
             if mode !='dac':
 
                 with torch.no_grad():
-                    semetic_real = teacher.encode(pre_audio.to('cpu'))
+                    semetic_real = teacher.module.encode(pre_audio)
                 semetic_real = accelerator.prepare(semetic_real)
             else:
                 semetic_real=None
@@ -496,8 +513,9 @@ for epoch in range(epochs):
 
 
         # TensorBoard 记录
-        if (i + 1) %accumulation_steps==0:
+        if (i + 1) % accumulation_steps==0:
             current_step = step//accumulation_steps  # 使用全局步数作为current_step
+            #step需要优化
             if accelerator.is_main_process:
                 writer.add_scalar('Train/Mel_Loss', output["mel/loss"], current_step)
                 writer.add_scalar('Train/STFT_Loss', output["stft/loss"], current_step)
@@ -521,7 +539,8 @@ for epoch in range(epochs):
 
     # 汇总每个epoch的输出
     epoch_summary = {k: sum(d[k] for d in epoch_output) / len(epoch_output) for k in epoch_output[0]}
-    writer.add_scalar('Train/Epoch_Loss', epoch_summary["loss"], epoch)
+    if writer is not None:
+        writer.add_scalar('Train/Epoch_Loss', epoch_summary["loss"], epoch)
     print(f"Training Summary: {epoch_summary}")
 
     # 每个epoch结束后清理缓存
